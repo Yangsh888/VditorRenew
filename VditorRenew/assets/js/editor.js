@@ -65,13 +65,10 @@
     
     let draftSaveTimer = null;
     let allowDraftWrite = false;
-    let cidEnsuring = false;
-    const cidWaiters = [];
-    const uploadQueue = [];
-    let uploadWaitTimer = null;
-    const dataImagePendingByName = new Map();
+    let pendingUploads = 0;
     const dataImageSeen = new Set();
     const uploadedAttachmentCids = new Set();
+    const uploadExtraData = { cid: '' };
     let serverLastModified = cfg.lastModified || 0;
 
     const initDraftCacheKey = () => {
@@ -253,104 +250,125 @@
         }
     };
 
-    const ensureCid = (cb) => {
-        const idInput = form.querySelector('input[name="cid"]');
-        const cidNow = parseInt((idInput && idInput.value) ? idInput.value : '0', 10) || 0;
+    const getCidInput = () => form.querySelector('input[name="cid"]');
+
+    const getCurrentCid = () => {
+        const input = getCidInput();
+        return parseInt((input && input.value) ? input.value : '0', 10) || 0;
+    };
+
+    const setCurrentCid = (cid) => {
+        const input = getCidInput();
+        if (input && cid > 0) {
+            input.value = String(cid);
+        }
+    };
+
+    const getUploadUrl = () => {
+        const area = document.querySelector('#upload-panel .upload-area');
+        return area ? String(area.getAttribute('data-url') || '') : '';
+    };
+
+    const ensureCidAsync = () => new Promise((resolve) => {
+        const cidNow = getCurrentCid();
         if (cidNow > 0) {
-            cb && cb(cidNow);
+            uploadExtraData.cid = String(cidNow);
+            resolve(cidNow);
             return;
         }
         if (!window.Typecho || typeof window.Typecho.ensureCid !== 'function') {
-            cb && cb(0);
+            resolve(0);
             return;
         }
-        if (cidEnsuring) {
-            cb && cidWaiters.push(cb);
-            return;
-        }
-        cidEnsuring = true;
-        cb && cidWaiters.push(cb);
         window.Typecho.ensureCid((cid) => {
-            cidEnsuring = false;
-            const list = cidWaiters.splice(0);
-            if (idInput) {
-                idInput.value = String(cid);
-            }
-            list.forEach((fn) => {
-                try {
-                    fn && fn(cid);
-                } catch (e) {
-                }
-            });
+            const nextCid = parseInt(cid || '0', 10) || 0;
+            setCurrentCid(nextCid);
+            uploadExtraData.cid = nextCid > 0 ? String(nextCid) : '';
+            resolve(nextCid);
         });
+    });
+
+    const parseNativeUploadPayload = (responseText) => {
+        try {
+            const payload = JSON.parse(String(responseText || ''));
+            if (Array.isArray(payload) && payload[1] && payload[1].url) {
+                return payload[1];
+            }
+        } catch (e) {
+        }
+        return null;
     };
 
-    const safeUploadFile = (file) => {
+    const registerAttachment = (attachment) => {
+        if (!attachment) {
+            return;
+        }
+        const cid = parseInt(attachment.cid || '0', 10) || 0;
+        if (cid > 0) {
+            uploadedAttachmentCids.add(cid);
+            updateAttachmentCidsInput();
+        }
+        if (
+            cid > 0
+            && window.Typecho
+            && typeof window.Typecho.appendAttachment === 'function'
+            && !document.querySelector('#file-list li[data-cid="' + cid + '"]')
+        ) {
+            window.Typecho.appendAttachment(attachment);
+        }
+    };
+
+    const uploadAttachmentFile = async (file) => {
         if (!file) {
-            return;
+            return null;
         }
-        if (!window.Typecho || typeof window.Typecho.uploadFile !== 'function') {
-            uploadQueue.push(file);
-            if (!uploadWaitTimer) {
-                let attempts = 0;
-                uploadWaitTimer = window.setInterval(() => {
-                    attempts += 1;
-                    if (window.Typecho && typeof window.Typecho.uploadFile === 'function') {
-                        window.clearInterval(uploadWaitTimer);
-                        uploadWaitTimer = null;
-                        const items = uploadQueue.splice(0);
-                        ensureCid(() => {
-                            items.forEach((f) => window.Typecho.uploadFile(f));
-                        });
-                        return;
-                    }
-                    if (attempts >= 100) {
-                        window.clearInterval(uploadWaitTimer);
-                        uploadWaitTimer = null;
-                        uploadQueue.length = 0;
-                        showNotice('上传能力不可用，请刷新页面或改用附件面板上传', 'error');
-                    }
-                }, 80);
+        const uploadUrl = getUploadUrl();
+        if (!uploadUrl) {
+            throw new Error('上传地址不可用，请刷新页面后重试');
+        }
+
+        pendingUploads++;
+
+        try {
+            const cid = await ensureCidAsync();
+            const data = new FormData();
+            data.append('file', file);
+            if (cid > 0) {
+                data.append('cid', String(cid));
             }
-            return;
+
+            const response = await fetch(uploadUrl, {
+                method: 'POST',
+                headers: {
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'Accept': 'application/json'
+                },
+                body: data
+            });
+            const text = await response.text();
+            const attachment = parseNativeUploadPayload(text);
+
+            if (!response.ok || !attachment) {
+                let message = '上传失败';
+                try {
+                    const payload = JSON.parse(text);
+                    if (payload && payload.message) {
+                        message = String(payload.message);
+                    }
+                } catch (e) {
+                }
+                throw new Error(message);
+            }
+
+            registerAttachment(attachment);
+            return attachment;
+        } finally {
+            pendingUploads = Math.max(0, pendingUploads - 1);
         }
-        ensureCid(() => window.Typecho.uploadFile(file));
     };
 
     const hasInlineDataUri = (text) => {
         return /\!\[[^\]]*\]\(\s*data:image\/[a-z0-9.+-]+;base64,[^)]+\)/i.test(String(text || ''));
-    };
-
-    const nextRefId = (markdown) => {
-        const text = String(markdown || '');
-        const re = /\[(\d+)\]:\s*/g;
-        let m;
-        let max = 0;
-        while ((m = re.exec(text))) {
-            const n = parseInt(m[1], 10);
-            if (n > max) {
-                max = n;
-            }
-        }
-        return max + 1;
-    };
-
-    const mdInsertInline = (file, url, isImage) => {
-        const safeFile = String(file || '').replace(/[\[\]]/g, '');
-        const safeUrl = String(url || '');
-        if (isImage) {
-            return '![' + safeFile + '](' + safeUrl + ')';
-        }
-        return '[' + safeFile + '](' + safeUrl + ')';
-    };
-
-    const mdInsertRef = (file, url, isImage, markdown) => {
-        const safeFile = String(file || '').replace(/[\[\]]/g, '');
-        const safeUrl = String(url || '');
-        const id = nextRefId(markdown);
-        const head = (isImage ? '![' + safeFile + ']' : '[' + safeFile + ']') + '[' + id + ']';
-        const def = '[' + id + ']: ' + safeUrl;
-        return { head, def, id };
     };
 
     const extractDataImageMarkdownAll = (markdown) => {
@@ -506,6 +524,71 @@
         icon: cfg.icon,
         toolbar: Array.isArray(cfg.toolbar) ? cfg.toolbar : undefined,
         toolbarConfig: { pin: true },
+        upload: {
+            url: getUploadUrl(),
+            fieldName: 'file',
+            multiple: false,
+            headers: {
+                'X-Requested-With': 'XMLHttpRequest',
+                'Accept': 'application/json'
+            },
+            extraData: uploadExtraData,
+            validate: (files) => {
+                const list = Array.from(files || []);
+                return list.length > 1 ? '请一次上传一个文件' : true;
+            },
+            file: (files) => {
+                const list = Array.from(files || []);
+                if (list.length === 0) {
+                    return list;
+                }
+
+                pendingUploads++;
+
+                return ensureCidAsync().then(() => list.slice(0, 1)).catch((error) => {
+                    pendingUploads = Math.max(0, pendingUploads - 1);
+                    throw error;
+                });
+            },
+            format: (files, responseText) => {
+                pendingUploads = Math.max(0, pendingUploads - 1);
+                const attachment = parseNativeUploadPayload(responseText);
+                if (!attachment) {
+                    return JSON.stringify({
+                        code: 1,
+                        msg: '上传返回格式错误',
+                        data: {
+                            errFiles: Array.from(files || []).map((file) => file.name),
+                            succMap: {}
+                        }
+                    });
+                }
+
+                registerAttachment(attachment);
+                if (allowDraftWrite && cfg.localCache && storage) {
+                    saveDraftWithAttachments();
+                }
+
+                const fileName = files && files[0] && files[0].name
+                    ? files[0].name
+                    : String(attachment.title || 'file');
+
+                return JSON.stringify({
+                    code: 0,
+                    msg: '',
+                    data: {
+                        errFiles: [],
+                        succMap: {
+                            [fileName]: attachment.url
+                        }
+                    }
+                });
+            },
+            error: (msg) => {
+                pendingUploads = Math.max(0, pendingUploads - 1);
+                showNotice(String(msg || '上传失败'), 'error');
+            }
+        },
         cache: {
             enable: false,
             id: cacheId
@@ -614,9 +697,31 @@
                 showNotice('剪贴板图片解析失败，请改用附件上传', 'error');
                 return;
             }
-            dataImagePendingByName.set(name, { full: it.full, alt: it.alt || 'image' });
             queued++;
-            safeUploadFile(file);
+            uploadAttachmentFile(file).then((attachment) => {
+                if (!attachment || !attachment.url || !editor) {
+                    return;
+                }
+
+                const latest = editor.getValue();
+                if (!latest.includes(it.full)) {
+                    return;
+                }
+
+                const replaced = latest.replace(it.full, '![' + (it.alt || 'image') + '](' + attachment.url + ')');
+                if (replaced === latest) {
+                    return;
+                }
+
+                editor.setValue(replaced);
+                syncValue(replaced);
+                if (draftSaveTimer) {
+                    clearTimeout(draftSaveTimer);
+                }
+                saveDraftWithAttachments();
+            }).catch((error) => {
+                showNotice(error && error.message ? error.message : '剪贴板图片上传失败，请改用附件上传', 'error');
+            });
         });
         if (queued > 0) {
             showNotice('检测到剪贴板图片，已自动上传为附件；上传成功后将自动替换为外链', 'notice');
@@ -636,13 +741,13 @@
                 showNotice('检测到未上传的剪贴板图片，请等待上传完成后再发布', 'error');
                 return;
             }
-            if (window.Typecho && typeof window.Typecho.getUploadPending === 'function') {
-                const pending = parseInt(window.Typecho.getUploadPending() || '0', 10) || 0;
-                if (pending > 0) {
-                    event.preventDefault();
-                    showNotice('正在上传附件，请等待上传完成后再提交', 'notice');
-                    return;
-                }
+            const nativePending = window.Typecho && typeof window.Typecho.getUploadPending === 'function'
+                ? (parseInt(window.Typecho.getUploadPending() || '0', 10) || 0)
+                : 0;
+            if (pendingUploads > 0 || nativePending > 0) {
+                event.preventDefault();
+                showNotice('正在上传附件，请等待上传完成后再提交', 'notice');
+                return;
             }
 
             let action = '';
@@ -672,80 +777,10 @@
             editor.insertValue(md + '\n');
             syncValue(editor.getValue());
         };
-        
+
         window.Typecho.uploadComplete = (attachment) => {
-            if (!attachment || !editor) {
-                return;
-            }
-            
-            const name = String(attachment.title || '');
-            const url = String(attachment.url || '');
-            const cid = attachment.cid || 0;
-            
-            if (cid > 0) {
-                uploadedAttachmentCids.add(cid);
-                updateAttachmentCidsInput();
-            }
-            
-            let foundName = null;
-            let foundPending = null;
-            for (const [pendingName, pending] of dataImagePendingByName.entries()) {
-                if (pendingName === name || 
-                    pendingName.replace(/\.[^.]+$/, '') === name.replace(/\.[^.]+$/, '')) {
-                    foundName = pendingName;
-                    foundPending = pending;
-                    break;
-                }
-            }
-            
-            if (!foundPending) {
-                const base64Pattern = /!\[([^\]]*)\]\(\s*data:image\/[a-z0-9.+-]+;base64,[^)]+\s*\)/gi;
-                const matches = [...editor.getValue().matchAll(base64Pattern)];
-                if (matches.length > 0) {
-                    const match = matches[0];
-                    foundPending = { full: match[0], alt: match[1] || 'image' };
-                }
-            }
-            
-            if (foundPending && foundPending.full) {
-                const latest = editor.getValue();
-                let replaced = latest.replace(foundPending.full, '![' + foundPending.alt + '](' + url + ')');
-                
-                if (replaced === latest && foundPending.full.includes('data:image')) {
-                    const base64Pattern = /!\[([^\]]*)\]\(\s*data:image\/[a-z0-9.+-]+;base64,[^)]+\s*\)/gi;
-                    const matches = [...latest.matchAll(base64Pattern)];
-                    for (const match of matches) {
-                        const alt = match[1] || 'image';
-                        if (alt === foundPending.alt || alt.includes(foundPending.alt) || foundPending.alt.includes(alt)) {
-                            replaced = latest.replace(match[0], '![' + alt + '](' + url + ')');
-                            if (replaced !== latest) {
-                                break;
-                            }
-                        }
-                    }
-                }
-                
-                if (foundName) {
-                    dataImagePendingByName.delete(foundName);
-                }
-                
-                if (replaced !== latest) {
-                    editor.setValue(replaced);
-                    syncValue(replaced);
-                    
-                    if (draftSaveTimer) {
-                        clearTimeout(draftSaveTimer);
-                    }
-                    saveDraftWithAttachments();
-                    return;
-                }
-            }
-        };
-        
-        window.Typecho.attachmentDeleted = (cid) => {
-            if (uploadedAttachmentCids.has(cid)) {
-                uploadedAttachmentCids.delete(cid);
-                updateAttachmentCidsInput();
+            registerAttachment(attachment);
+            if (allowDraftWrite && cfg.localCache && storage) {
                 saveDraftWithAttachments();
             }
         };
@@ -823,19 +858,42 @@
     };
 
     const bindAttachmentEvents = () => {
-        if (!window.jQuery) {
-            return;
+        const syncAttachmentList = () => {
+            document.querySelectorAll('#file-list li[data-cid]').forEach((item) => {
+                const cid = parseInt(item.getAttribute('data-cid') || '0', 10) || 0;
+                if (cid > 0) {
+                    uploadedAttachmentCids.add(cid);
+                }
+            });
+            updateAttachmentCidsInput();
+        };
+
+        const fileList = document.getElementById('file-list');
+        if (fileList && window.MutationObserver) {
+            const observer = new MutationObserver(() => {
+                syncAttachmentList();
+                if (allowDraftWrite && cfg.localCache && storage) {
+                    saveDraftWithAttachments();
+                }
+            });
+            observer.observe(fileList, { childList: true });
         }
-        
-        const $ = window.jQuery;
-        
-        $(document).on('click', '#file-list .delete', function(e) {
-            const $li = $(this).closest('li');
-            const cid = $li.data('cid');
-            if (cid && window.Typecho && typeof window.Typecho.attachmentDeleted === 'function') {
-                window.Typecho.attachmentDeleted(cid);
-            }
-        });
+
+        if (window.jQuery) {
+            const $ = window.jQuery;
+            $(document).on('attachmentDeleted', function (event, cid) {
+                const attachmentCid = parseInt(cid || '0', 10) || 0;
+                if (attachmentCid > 0 && uploadedAttachmentCids.has(attachmentCid)) {
+                    uploadedAttachmentCids.delete(attachmentCid);
+                    updateAttachmentCidsInput();
+                    if (allowDraftWrite && cfg.localCache && storage) {
+                        saveDraftWithAttachments();
+                    }
+                }
+            });
+        }
+
+        syncAttachmentList();
     };
 
     initModeSwitch();
