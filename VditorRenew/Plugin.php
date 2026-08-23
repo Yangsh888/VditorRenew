@@ -1,4 +1,23 @@
 <?php
+declare(strict_types=1);
+
+namespace TypechoPlugin\VditorRenew;
+
+use Typecho\Common;
+use Typecho\Plugin as Hook;
+use Typecho\Plugin\PluginInterface;
+use Typecho\Widget\Helper\Form;
+use Widget\Plugins\Edit as PluginsEdit;
+use Utils\Helper;
+use Utils\NoPersonal;
+use Utils\Pref;
+use Throwable;
+use Typecho\Plugin\Exception as PluginException;
+
+if (!defined('__TYPECHO_ROOT_DIR__')) {
+    exit;
+}
+
 /**
  * 【TypeRenew 专用】Vditor 编辑器拓展
  *
@@ -8,18 +27,7 @@
  * @version 1.3.0
  * @since 1.4.1
  */
-if (!defined('__TYPECHO_ROOT_DIR__')) {
-    exit;
-}
-
-use Typecho\Common;
-use Typecho\Plugin\PluginInterface;
-use Typecho\Widget\Helper\Form;
-use Utils\Helper;
-use Utils\NoPersonal;
-use Utils\Pref;
-
-class VditorRenew_Plugin implements PluginInterface
+class Plugin implements PluginInterface
 {
     use NoPersonal;
 
@@ -28,26 +36,43 @@ class VditorRenew_Plugin implements PluginInterface
     private const DIST_REL = 'assets/vditor/dist';
     private static ?array $runtimeSettings = null;
 
-    public static function activate()
+    public static function activate(): string
     {
         if (!self::hasDist()) {
-            throw new Typecho_Plugin_Exception(_t('Vditor 资源目录不完整，请重新上传插件文件'));
+            throw new PluginException(_t('Vditor 资源目录不完整，请重新上传插件文件'));
         }
-        Typecho_Plugin::factory('admin/write-post.php')->richEditor = ['VditorRenew_Bridge', 'post'];
-        Typecho_Plugin::factory('admin/write-page.php')->richEditor = ['VditorRenew_Bridge', 'page'];
+        Hook::factory('admin/write.php')->forceMarkdown = [self::class, 'forceMarkdown'];
+        Hook::factory('admin/write-post.php')->richEditor = [Bridge::class, 'post'];
+        Hook::factory('admin/write-page.php')->richEditor = [Bridge::class, 'page'];
         self::ensureConfigStored();
         self::clearConfigCache();
         return _t('Vditor 编辑器插件已启用');
     }
 
-    public static function deactivate()
+    public static function deactivate(): string
     {
         self::clearConfigCache();
+        return _t('Vditor 编辑器插件已停用');
     }
 
-    public static function config(Form $form)
+    public static function forceMarkdown($forced, $content): bool
     {
-        $defaults = self::defaults();
+        $settings = self::getSettings();
+
+        if (empty($settings['enabled'])) {
+            return (bool) $forced;
+        }
+
+        $legacy = ($content->have() && !$content->isMarkdown)
+            ? (string) ($settings['legacy'] ?? 'convert')
+            : 'raw';
+
+        return !$content->have() || $content->isMarkdown || $legacy === 'convert';
+    }
+
+    public static function config(Form $form): void
+    {
+        $defaults = self::getSettings();
 
         $enabled = new Form\Element\Radio(
             'enabled',
@@ -139,11 +164,11 @@ class VditorRenew_Plugin implements PluginInterface
 
     }
 
-    public static function configHandle(array &$settings, bool $isInit)
+    public static function configHandle(array $settings, bool $_isInit): void
     {
-        $settings = self::toStoredSettings($settings);
+        $stored = self::toStoredSettings($settings);
 
-        \Widget\Plugins\Edit::configPlugin(self::NAME, $settings);
+        PluginsEdit::configPlugin(self::NAME, $stored);
         self::clearConfigCache();
     }
 

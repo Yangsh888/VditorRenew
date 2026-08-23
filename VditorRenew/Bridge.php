@@ -1,9 +1,17 @@
 <?php
+declare(strict_types=1);
+
+namespace TypechoPlugin\VditorRenew;
+
+use Typecho\Common;
+use Widget\Options;
+use Utils\Helper;
+
 if (!defined('__TYPECHO_ROOT_DIR__')) {
     exit;
 }
 
-class VditorRenew_Bridge
+class Bridge
 {
     public static function post($post): void
     {
@@ -17,11 +25,11 @@ class VditorRenew_Bridge
 
     private static function render($content, string $type): void
     {
-        $settings = VditorRenew_Plugin::getSettings();
+        $settings = Plugin::getSettings();
         $hasContent = !empty($content->have());
         $isMarkdown = $hasContent && !empty($content->isMarkdown);
         $isLegacy = $hasContent && !$isMarkdown;
-        $options = \Widget\Options::alloc();
+        $options = Options::alloc();
         $markdownEnabled = !empty($options->markdown);
 
         if (empty($settings['enabled'])) {
@@ -29,7 +37,7 @@ class VditorRenew_Bridge
             return;
         }
 
-        if (!VditorRenew_Plugin::hasDist()) {
+        if (!Plugin::hasDist()) {
             self::fallback($content, $type);
             return;
         }
@@ -41,19 +49,19 @@ class VditorRenew_Bridge
             return;
         }
 
-        $cdn = VditorRenew_Plugin::assetUrl('assets/vditor');
+        $cdn = Plugin::assetUrl('assets/vditor');
 
         $toolbar = self::toolbar($settings);
         $allowMarkdown = $markdownEnabled || $isMarkdown || $forceMarkdown;
         $isNew = empty($content->cid);
-        
+
         $lastModified = 0;
         if ($hasContent && !empty($content->modified)) {
             $lastModified = (int) $content->modified;
         } elseif ($hasContent && !empty($content->created)) {
             $lastModified = (int) $content->created;
         }
-        
+
         $config = [
             'mode' => $settings['mode'],
             'modeSwitch' => (bool) $settings['modeSwitch'],
@@ -81,19 +89,19 @@ class VditorRenew_Bridge
             'cdn' => $cdn
         ];
 
-        $configJson = \Typecho\Common::jsonEncode(
+        $configJson = Common::jsonEncode(
             $config,
             JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT,
             '{}'
         );
         ?>
-<link rel="stylesheet" href="<?php echo VditorRenew_Plugin::assetUrl('assets/vditor/dist/index.css'); ?>">
-<link rel="stylesheet" href="<?php echo VditorRenew_Plugin::assetUrl('assets/css/editor.css'); ?>">
-<script src="<?php echo VditorRenew_Plugin::assetUrl('assets/vditor/dist/index.min.js'); ?>"></script>
+<link rel="stylesheet" href="<?php echo Plugin::assetUrl('assets/vditor/dist/index.css'); ?>">
+<link rel="stylesheet" href="<?php echo Plugin::assetUrl('assets/css/editor.css'); ?>">
+<script src="<?php echo Plugin::assetUrl('assets/vditor/dist/index.min.js'); ?>"></script>
 <script>
 window.VditorRenewConfig = <?php echo $configJson; ?>;
 </script>
-<script src="<?php echo VditorRenew_Plugin::assetUrl('assets/js/editor.js'); ?>"></script>
+<script src="<?php echo Plugin::assetUrl('assets/js/editor.js'); ?>"></script>
         <?php
     }
 
